@@ -1,6 +1,6 @@
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
 import { ethers, fhevm } from "hardhat";
-import { FHECounter, FHECounter__factory } from "../types";
+import { HushOracle, HushOracle__factory } from "../types";
 import { expect } from "chai";
 import { FhevmType } from "@fhevm/hardhat-plugin";
 
@@ -11,17 +11,17 @@ type Signers = {
 };
 
 async function deployFixture() {
-  const factory = (await ethers.getContractFactory("FHECounter")) as FHECounter__factory;
-  const fheCounterContract = (await factory.deploy()) as FHECounter;
-  const fheCounterContractAddress = await fheCounterContract.getAddress();
+  const factory = (await ethers.getContractFactory("HushOracle")) as HushOracle__factory;
+  const hushOracleContract = (await factory.deploy()) as HushOracle;
+  const hushOracleAddress = await hushOracleContract.getAddress();
 
-  return { fheCounterContract, fheCounterContractAddress };
+  return { hushOracleContract, hushOracleAddress };
 }
 
-describe("FHECounter", function () {
+describe("HushOracle", function () {
   let signers: Signers;
-  let fheCounterContract: FHECounter;
-  let fheCounterContractAddress: string;
+  let hushOracleContract: HushOracle;
+  let hushOracleAddress: string;
 
   before(async function () {
     const ethSigners: HardhatEthersSigner[] = await ethers.getSigners();
@@ -29,76 +29,86 @@ describe("FHECounter", function () {
   });
 
   beforeEach(async function () {
-    // Check whether the tests are running against an FHEVM mock environment
     if (!fhevm.isMock) {
       console.warn(`This hardhat test suite cannot run on Sepolia Testnet`);
       this.skip();
     }
 
-    ({ fheCounterContract, fheCounterContractAddress } = await deployFixture());
+    ({ hushOracleContract, hushOracleAddress } = await deployFixture());
   });
 
-  it("encrypted count should be uninitialized after deployment", async function () {
-    const encryptedCount = await fheCounterContract.getCount();
-    // Expect initial count to be bytes32(0) after deployment,
-    // (meaning the encrypted count value is uninitialized)
-    expect(encryptedCount).to.eq(ethers.ZeroHash);
-  });
+  it("records daily prices and predictions", async function () {
+    const currentDay = await hushOracleContract.getCurrentDay();
+    await hushOracleContract.connect(signers.deployer).updateDailyPrices(350_000n, 6_200_000n);
 
-  it("increment the counter by 1", async function () {
-    const encryptedCountBeforeInc = await fheCounterContract.getCount();
-    expect(encryptedCountBeforeInc).to.eq(ethers.ZeroHash);
-    const clearCountBeforeInc = 0;
+    const dailyPrice = await hushOracleContract.getDailyPrice(currentDay);
+    expect(dailyPrice[0]).to.eq(350_000n);
+    expect(dailyPrice[1]).to.eq(6_200_000n);
+    expect(dailyPrice[2]).to.not.eq(0n);
 
-    // Encrypt constant 1 as a euint32
-    const clearOne = 1;
-    const encryptedOne = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(clearOne)
+    const encryptedInput = await fhevm
+      .createEncryptedInput(hushOracleAddress, signers.alice.address)
+      .add64(360_000n)
+      .add8(1)
       .encrypt();
 
-    const tx = await fheCounterContract
-      .connect(signers.alice)
-      .increment(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
+    const stake = ethers.parseEther("0.01");
 
-    const encryptedCountAfterInc = await fheCounterContract.getCount();
-    const clearCountAfterInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountAfterInc,
-      fheCounterContractAddress,
+    await hushOracleContract
+      .connect(signers.alice)
+      .placePrediction(0, encryptedInput.handles[0], encryptedInput.handles[1], encryptedInput.inputProof, {
+        value: stake,
+      });
+
+    const targetDay = currentDay + 1n;
+    const prediction = await hushOracleContract.getPrediction(signers.alice.address, 0, targetDay);
+
+    expect(prediction[2]).to.eq(stake);
+    expect(prediction[3]).to.eq(false);
+  });
+
+  it("awards points after confirmation on the next day", async function () {
+    const day0 = await hushOracleContract.getCurrentDay();
+    await hushOracleContract.connect(signers.deployer).updateDailyPrices(300_000n, 6_000_000n);
+
+    const encryptedInput = await fhevm
+      .createEncryptedInput(hushOracleAddress, signers.alice.address)
+      .add64(310_000n)
+      .add8(1)
+      .encrypt();
+
+    const stake = ethers.parseEther("0.02");
+
+    await hushOracleContract
+      .connect(signers.alice)
+      .placePrediction(0, encryptedInput.handles[0], encryptedInput.handles[1], encryptedInput.inputProof, {
+        value: stake,
+      });
+
+    await ethers.provider.send("evm_increaseTime", [24 * 60 * 60 + 10]);
+    await ethers.provider.send("evm_mine", []);
+
+    const day1 = day0 + 1n;
+    await hushOracleContract.connect(signers.deployer).updateDailyPrices(300_000n, 6_100_000n);
+
+    await expect(hushOracleContract.connect(signers.alice).confirmPrediction(0, day1)).to.be.revertedWithCustomError(
+      hushOracleContract,
+      "TooEarly",
+    );
+
+    await ethers.provider.send("evm_increaseTime", [24 * 60 * 60 + 10]);
+    await ethers.provider.send("evm_mine", []);
+
+    await hushOracleContract.connect(signers.alice).confirmPrediction(0, day1);
+
+    const encryptedPoints = await hushOracleContract.getUserPoints(signers.alice.address);
+    const clearPoints = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      encryptedPoints,
+      hushOracleAddress,
       signers.alice,
     );
 
-    expect(clearCountAfterInc).to.eq(clearCountBeforeInc + clearOne);
-  });
-
-  it("decrement the counter by 1", async function () {
-    // Encrypt constant 1 as a euint32
-    const clearOne = 1;
-    const encryptedOne = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(clearOne)
-      .encrypt();
-
-    // First increment by 1, count becomes 1
-    let tx = await fheCounterContract
-      .connect(signers.alice)
-      .increment(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
-
-    // Then decrement by 1, count goes back to 0
-    tx = await fheCounterContract.connect(signers.alice).decrement(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
-
-    const encryptedCountAfterDec = await fheCounterContract.getCount();
-    const clearCountAfterInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountAfterDec,
-      fheCounterContractAddress,
-      signers.alice,
-    );
-
-    expect(clearCountAfterInc).to.eq(0);
+    expect(clearPoints).to.eq(stake);
   });
 });
